@@ -7,6 +7,8 @@ headset (USB `1532:0555`) on Linux, talking to the OpenRazer daemon.
 
 ## Features
 
+- Lives in the system tray: click the icon to show or hide the settings, hover it for the
+  battery level, right-click for Settings / Quit. Starts in the tray at login.
 - Battery level and charging state (live, in the header bar)
 - 10-band equalizer (±5 dB), applied by the headset's own DSP — all presets and curves live
   **in the headset**, so they keep working standalone (console, other PC)
@@ -38,13 +40,28 @@ Installs per-user (no root): the app goes to `~/.local/bin/blackshark-gui` and a
 `~/.local/share/applications/`, so "BlackShark V2 Pro" shows up in your application menu. The
 script checks the dependencies first and tells you what is missing.
 
+It also adds an autostart entry (`~/.config/autostart/`) that runs `blackshark-gui --background`
+at login, which brings the app up in the tray without opening the window. Delete that file if
+you would rather start it by hand.
+
+## System tray
+
+The tray icon is a StatusNotifierItem: it shows up natively on KDE Plasma and most other
+desktops, on GNOME with the AppIndicator extension. Closing the window keeps the app running in
+the tray; use **Quit** in the icon's right-click menu to stop it. While the headset is off or
+unplugged the icon goes passive (Plasma moves it to the hidden icons), and it shows a muted
+microphone while the headset's own mute button is engaged.
+
+Without a tray the app behaves like a plain window again: closing it quits, and a
+`--background` start gives up after 30 seconds.
+
 ## Uninstall
 
 ```sh
 ./uninstall.sh
 ```
 
-Removes the app and the desktop entry.
+Removes the app, the desktop entry and the autostart entry.
 
 ## Troubleshooting
 

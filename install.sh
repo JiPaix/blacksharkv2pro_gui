@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 
 BIN_DIR="${HOME}/.local/bin"
 APP_DIR="${HOME}/.local/share/applications"
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/autostart"
 DESKTOP_ID="dev.blacksharkv2pro.gui.desktop"
 
 echo "== checking dependencies =="
@@ -30,9 +31,14 @@ echo "== installing =="
 install -Dm755 blackshark-gui "${BIN_DIR}/blackshark-gui"
 mkdir -p "${APP_DIR}"
 sed "s|@EXEC@|${BIN_DIR}/blackshark-gui|" "${DESKTOP_ID}" > "${APP_DIR}/${DESKTOP_ID}"
+# start in the tray at login
+mkdir -p "${AUTOSTART_DIR}"
+sed "s|@EXEC@|${BIN_DIR}/blackshark-gui --background|" "${DESKTOP_ID}" > "${AUTOSTART_DIR}/${DESKTOP_ID}"
 update-desktop-database "${APP_DIR}" 2>/dev/null || true
 
 echo "== done =="
 echo "Installed: ${BIN_DIR}/blackshark-gui"
 echo "Installed: ${APP_DIR}/${DESKTOP_ID}"
-echo "Launch it from your app menu ('BlackShark V2 Pro') or run: blackshark-gui"
+echo "Installed: ${AUTOSTART_DIR}/${DESKTOP_ID}"
+echo "It starts in the system tray at login. To start it now, launch it from"
+echo "your app menu ('BlackShark V2 Pro') or run: blackshark-gui"

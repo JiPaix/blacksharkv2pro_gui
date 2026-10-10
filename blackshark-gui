@@ -7,16 +7,21 @@ auto power-off timer, sidetone, do-not-disturb, system mic mute and the
 headset's own mute-button state. Device identity (serial, firmware, hardware
 id) is in the (i) popover in the header.
 
+Lives in the system tray (StatusNotifierItem): clicking the icon shows or
+hides the settings window, closing the window keeps the app in the tray.
+Start it with --background to come up in the tray without a window.
+
 Requires the razerblackshark driver and daemon with the sidetone/dnd API.
 """
 import subprocess
+import sys
 import threading
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 BAND_LABELS = ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
 EQ_PRESETS = {
@@ -35,6 +40,119 @@ MIC_ICON_LIVE = "audio-input-microphone-symbolic"
 MIC_ICON_MUTED = "microphone-disabled-symbolic"
 
 
+# Tray icons are drawn by the tray host from its own icon theme, so these are
+# names both Breeze and Adwaita carry (MIC_ICON_MUTED is Adwaita-only).
+TRAY_ICON = "audio-headset-symbolic"
+TRAY_ICON_MUTED = "microphone-sensitivity-muted-symbolic"
+# While the window is hidden only the tray needs feeding, so poll every
+# TRAY_POLL_TICKS-th tick (ticks are 10 s apart) instead of every one.
+TRAY_POLL_TICKS = 3
+# A --background start with no tray to sit in would be an invisible process;
+# give the tray host this long to show up before giving up.
+TRAY_WAIT_SECONDS = 30
+
+SNI_WATCHER = "org.kde.StatusNotifierWatcher"
+SNI_PATH = "/StatusNotifierItem"
+MENU_PATH = "/StatusNotifierItem/Menu"
+SNI_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="WindowId" type="i" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+    <method name="ProvideXdgActivationToken">
+      <arg name="token" type="s" direction="in"/>
+    </method>
+    <method name="Activate">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="SecondaryActivate">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="ContextMenu">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="Scroll">
+      <arg name="delta" type="i" direction="in"/>
+      <arg name="orientation" type="s" direction="in"/>
+    </method>
+    <signal name="NewIcon"/>
+    <signal name="NewToolTip"/>
+    <signal name="NewStatus">
+      <arg name="status" type="s"/>
+    </signal>
+  </interface>
+</node>
+"""
+MENU_XML = """
+<node>
+  <interface name="com.canonical.dbusmenu">
+    <property name="Version" type="u" access="read"/>
+    <property name="TextDirection" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconThemePath" type="as" access="read"/>
+    <method name="GetLayout">
+      <arg name="parentId" type="i" direction="in"/>
+      <arg name="recursionDepth" type="i" direction="in"/>
+      <arg name="propertyNames" type="as" direction="in"/>
+      <arg name="revision" type="u" direction="out"/>
+      <arg name="layout" type="(ia{sv}av)" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg name="ids" type="ai" direction="in"/>
+      <arg name="propertyNames" type="as" direction="in"/>
+      <arg name="properties" type="a(ia{sv})" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="name" type="s" direction="in"/>
+      <arg name="value" type="v" direction="out"/>
+    </method>
+    <method name="Event">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="eventId" type="s" direction="in"/>
+      <arg name="data" type="v" direction="in"/>
+      <arg name="timestamp" type="u" direction="in"/>
+    </method>
+    <method name="EventGroup">
+      <arg name="events" type="a(isvu)" direction="in"/>
+      <arg name="idErrors" type="ai" direction="out"/>
+    </method>
+    <method name="AboutToShow">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="needUpdate" type="b" direction="out"/>
+    </method>
+    <method name="AboutToShowGroup">
+      <arg name="ids" type="ai" direction="in"/>
+      <arg name="updatesNeeded" type="ai" direction="out"/>
+      <arg name="idErrors" type="ai" direction="out"/>
+    </method>
+    <signal name="ItemsPropertiesUpdated">
+      <arg name="updatedProps" type="a(ia{sv})"/>
+      <arg name="removedProps" type="a(ias)"/>
+    </signal>
+    <signal name="LayoutUpdated">
+      <arg name="revision" type="u"/>
+      <arg name="parent" type="i"/>
+    </signal>
+    <signal name="ItemActivationRequested">
+      <arg name="id" type="i"/>
+      <arg name="timestamp" type="u"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+
 def find_device():
     from openrazer.client import DeviceManager
     for d in DeviceManager().devices:
@@ -43,11 +161,164 @@ def find_device():
     return None
 
 
+class Tray:
+    """System tray icon, spoken directly over D-Bus.
+
+    GTK4 has no tray API, so this exports a StatusNotifierItem (the protocol
+    behind the Plasma tray and GNOME's AppIndicator extension) plus the small
+    com.canonical.dbusmenu the host draws as the right-click menu.
+    """
+
+    def __init__(self, conn, on_activate, on_quit):
+        self.conn = conn
+        self.on_activate = on_activate
+        #: True while a tray host has our item, i.e. hiding the window is safe.
+        self.available = False
+        self.status = "Passive"
+        self.icon = TRAY_ICON
+        self.tooltip = "Searching for headset…"
+        #: xdg-activation token the host hands over right before Activate;
+        #: without it a Wayland compositor won't let the window take focus.
+        self.token = None
+        # Right-click menu: id -> (dbusmenu properties, callback).
+        self.menu = {
+            1: ({"label": GLib.Variant("s", "Settings"),
+                 "icon-name": GLib.Variant("s", "configure")},
+                lambda: self.on_activate(None)),
+            2: ({"type": GLib.Variant("s", "separator")}, None),
+            3: ({"label": GLib.Variant("s", "Quit"),
+                 "icon-name": GLib.Variant("s", "application-exit")},
+                on_quit),
+        }
+
+        sni = Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0]
+        menu = Gio.DBusNodeInfo.new_for_xml(MENU_XML).interfaces[0]
+        conn.register_object(SNI_PATH, sni, self.sni_call, self.sni_get, None)
+        conn.register_object(MENU_PATH, menu, self.menu_call, self.menu_get, None)
+        # Watching (rather than registering once) also covers a tray host that
+        # starts after us at login or gets restarted.
+        Gio.bus_watch_name_on_connection(
+            conn, SNI_WATCHER, Gio.BusNameWatcherFlags.NONE,
+            self.on_watcher_appeared, self.on_watcher_vanished)
+
+    def on_watcher_appeared(self, conn, _name, _owner):
+        conn.call(SNI_WATCHER, "/StatusNotifierWatcher", SNI_WATCHER,
+                  "RegisterStatusNotifierItem",
+                  GLib.Variant("(s)", (conn.get_unique_name(),)), None,
+                  Gio.DBusCallFlags.NONE, -1, None, self.on_registered)
+
+    def on_registered(self, conn, result):
+        try:
+            conn.call_finish(result)
+        except GLib.Error:
+            return
+        self.available = True
+
+    def on_watcher_vanished(self, _conn, _name):
+        self.available = False
+
+    def emit(self, signal, params=None):
+        self.conn.emit_signal(None, SNI_PATH, "org.kde.StatusNotifierItem",
+                              signal, params)
+
+    def update(self, present, tooltip, muted):
+        """Reflect the headset state: the item goes passive (the host tucks
+        it away) while the headset is gone, and shows the muted mic while the
+        headset's own mute button is engaged."""
+        status = "Active" if present else "Passive"
+        icon = TRAY_ICON_MUTED if present and muted else TRAY_ICON
+        if status != self.status:
+            self.status = status
+            self.emit("NewStatus", GLib.Variant("(s)", (status,)))
+        if icon != self.icon:
+            self.icon = icon
+            self.emit("NewIcon")
+        if tooltip != self.tooltip:
+            self.tooltip = tooltip
+            self.emit("NewToolTip")
+
+    # --- org.kde.StatusNotifierItem ---------------------------------------
+
+    def sni_get(self, _conn, _sender, _path, _iface, name):
+        return {
+            "Category": GLib.Variant("s", "Hardware"),
+            "Id": GLib.Variant("s", "blackshark-gui"),
+            "Title": GLib.Variant("s", "BlackShark V2 Pro"),
+            "Status": GLib.Variant("s", self.status),
+            "WindowId": GLib.Variant("i", 0),
+            "IconName": GLib.Variant("s", self.icon),
+            "ToolTip": GLib.Variant("(sa(iiay)ss)",
+                                    ("", [], "BlackShark V2 Pro", self.tooltip)),
+            "ItemIsMenu": GLib.Variant("b", False),
+            "Menu": GLib.Variant("o", MENU_PATH),
+        }[name]
+
+    def sni_call(self, _conn, _sender, _path, _iface, method, params, invocation):
+        if method == "ProvideXdgActivationToken":
+            self.token = params.unpack()[0]
+        elif method in ("Activate", "SecondaryActivate"):
+            token, self.token = self.token, None
+            self.on_activate(token)
+        # ContextMenu and Scroll: nothing to do, the host draws the menu.
+        invocation.return_value(None)
+
+    # --- com.canonical.dbusmenu -------------------------------------------
+
+    def menu_get(self, _conn, _sender, _path, _iface, name):
+        return {
+            "Version": GLib.Variant("u", 3),
+            "TextDirection": GLib.Variant("s", "ltr"),
+            "Status": GLib.Variant("s", "normal"),
+            "IconThemePath": GLib.Variant("as", []),
+        }[name]
+
+    def menu_call(self, _conn, _sender, _path, _iface, method, params, invocation):
+        args = params.unpack()
+        reply = None
+        if method == "GetLayout":
+            items = [GLib.Variant("(ia{sv}av)", (i, props, []))
+                     for i, (props, _cb) in self.menu.items()]
+            root = {"children-display": GLib.Variant("s", "submenu")}
+            if args[0] in self.menu:      # a leaf asked for by id
+                layout = (args[0], self.menu[args[0]][0], [])
+            else:
+                layout = (0, root, items)
+            reply = GLib.Variant("(u(ia{sv}av))", (1, layout))
+        elif method == "GetGroupProperties":
+            ids = args[0] or list(self.menu)
+            reply = GLib.Variant("(a(ia{sv}))", (
+                [(i, self.menu[i][0]) for i in ids if i in self.menu],))
+        elif method == "GetProperty":
+            props = self.menu.get(args[0], ({}, None))[0]
+            reply = GLib.Variant("(v)", (props.get(args[1], GLib.Variant("s", "")),))
+        elif method == "Event":
+            self.menu_event(args[0], args[1])
+        elif method == "EventGroup":
+            for item, event, _data, _time in args[0]:
+                self.menu_event(item, event)
+            reply = GLib.Variant("(ai)", ([],))
+        elif method == "AboutToShow":
+            reply = GLib.Variant("(b)", (False,))
+        elif method == "AboutToShowGroup":
+            reply = GLib.Variant("(aiai)", ([], []))
+        invocation.return_value(reply)
+
+    def menu_event(self, item, event):
+        callback = self.menu.get(item, (None, None))[1]
+        if event == "clicked" and callback:
+            # after the reply has gone out: Quit tears the connection down
+            GLib.idle_add(lambda: callback() and False)
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="BlackShark V2 Pro",
                          default_width=720, default_height=700)
         self.device = None
+        self.tray = None  # set by App once the tray item is exported
+        self.battery_text = None
+        self.hw_muted = False
+        self.ticks = 0
         self.dev_lock = threading.Lock()
         self.eq_timeout = None
         self.sleep_timeout = None
@@ -329,6 +600,7 @@ class Window(Adw.ApplicationWindow):
             self.status_row.set_title("Headset not found")
             self.status_row.set_subtitle("Is the dongle connected and the daemon running?")
             self.battery_label.set_label("–")
+            self.update_tray()
             return
 
         d = self.device
@@ -380,17 +652,36 @@ class Window(Adw.ApplicationWindow):
             level = int(self.device.battery_level)
             charging = " ⚡" if self.device.is_charging else ""
             self.battery_label.set_label(f"🔋 {level}%{charging}")
-            self.status_row.set_subtitle(
-                f"Battery {level}%" + (" — charging" if charging else ""))
+            self.battery_text = f"Battery {level}%" + (" — charging" if charging else "")
+            self.status_row.set_subtitle(self.battery_text)
         except Exception:
             # device vanished (unplugged / passed to a VM); rediscover on next tick
             self.device = None
             self.battery_label.set_label("–")
             self.status_row.set_title("Headset not found")
             self.status_row.set_subtitle("Reconnecting automatically…")
+        self.update_tray()
+
+    def update_tray(self):
+        if self.tray is None:
+            return
+        present = self.device is not None
+        self.tray.update(present,
+                         self.battery_text if present else "Headset not found",
+                         self.hw_muted)
 
     def tick(self):
         """Periodic: refresh battery + preset, rediscover the device if gone."""
+        self.ticks += 1
+        if not self.get_visible():
+            # in the tray: only the icon and tooltip are on show
+            if self.ticks % TRAY_POLL_TICKS == 0:
+                if self.device is None:
+                    self.refresh_all()
+                else:
+                    self.poll_battery()
+                    self.poll_hw_mute()
+            return True
         if self.device is None:
             self.refresh_all()
         else:
@@ -611,6 +902,9 @@ class Window(Adw.ApplicationWindow):
         except Exception:
             self.hw_mute_button.set_visible(False)   # older daemon
             return
+        if muted != self.hw_muted:
+            self.hw_muted = muted
+            self.update_tray()
         self.hw_mute_button.set_visible(True)
         self.hw_mute_button.set_icon_name(
             MIC_ICON_MUTED if muted else MIC_ICON_LIVE)
@@ -660,22 +954,58 @@ class Window(Adw.ApplicationWindow):
 
 
 class App(Adw.Application):
-    def __init__(self):
+    def __init__(self, background=False):
         super().__init__(application_id="dev.blacksharkv2pro.gui")
+        self.background = background  # come up in the tray, no window
+        self.tray = None
+        self.win = None
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        self.tray = Tray(self.get_dbus_connection(), self.toggle_window, self.quit)
+        if self.background:
+            GLib.timeout_add_seconds(TRAY_WAIT_SECONDS, self.check_tray)
 
     def do_activate(self):
-        win = self.get_active_window()
-        if win is None:
-            win = Window(self)
-            # quit the process when the window closes; otherwise the polling
-            # timers keep a headless instance alive that swallows relaunches
-            win.connect("close-request", self.on_close_request)
-        win.present()
+        if self.win is None:
+            self.win = Window(self)
+            self.win.tray = self.tray
+            self.win.update_tray()
+            self.win.connect("close-request", self.on_close_request)
+            if self.background:
+                return
+        # also reached by a relaunch from the app menu while in the tray
+        self.show_window()
+
+    def show_window(self, token=None):
+        if not self.win.get_visible():
+            self.win.refresh_all()  # polling was throttled while hidden
+        if token:
+            self.win.set_startup_id(token)
+        self.win.present()
+
+    def toggle_window(self, token):
+        """Tray icon clicked. A window that is open but buried under others
+        is raised rather than hidden."""
+        if self.win.get_visible() and self.win.is_active():
+            self.win.set_visible(False)
+        else:
+            self.show_window(token)
+
+    def check_tray(self):
+        if not self.tray.available and not self.win.get_visible():
+            self.quit()
+        return False
 
     def on_close_request(self, _win):
+        if self.tray.available:
+            self.win.set_visible(False)   # stay in the tray
+            return True
+        # no tray to come back from: quit, or the polling timers keep a
+        # headless instance alive
         self.quit()
         return False
 
 
 if __name__ == "__main__":
-    App().run(None)
+    App(background="--background" in sys.argv[1:]).run(None)

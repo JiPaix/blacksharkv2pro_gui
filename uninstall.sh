@@ -4,8 +4,9 @@ set -e
 
 BIN="${HOME}/.local/bin/blackshark-gui"
 DESKTOP="${HOME}/.local/share/applications/dev.blacksharkv2pro.gui.desktop"
+AUTOSTART="${XDG_CONFIG_HOME:-${HOME}/.config}/autostart/dev.blacksharkv2pro.gui.desktop"
 
-for f in "$BIN" "$DESKTOP"; do
+for f in "$BIN" "$DESKTOP" "$AUTOSTART"; do
     if [ -f "$f" ]; then
         rm "$f"
         echo "Removed: $f"
