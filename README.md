@@ -8,7 +8,8 @@ headset (USB `1532:0555`) on Linux, talking to the OpenRazer daemon.
 ## Features
 
 - Lives in the system tray: click the icon to show or hide the settings, hover it for the
-  battery level, right-click for Settings / Quit. Starts in the tray at login.
+  battery level, right-click for Settings / Quit. Starts in the tray at login. Tested on KDE
+  Plasma only — see [System tray](#system-tray).
 - Battery level and charging state (live, in the header bar)
 - 10-band equalizer (±5 dB), applied by the headset's own DSP — all presets and curves live
   **in the headset**, so they keep working standalone (console, other PC)
@@ -46,11 +47,15 @@ you would rather start it by hand.
 
 ## System tray
 
-The tray icon is a StatusNotifierItem: it shows up natively on KDE Plasma and most other
-desktops, on GNOME with the AppIndicator extension. Closing the window keeps the app running in
-the tray; use **Quit** in the icon's right-click menu to stop it. While the headset is off or
-unplugged the icon goes passive (Plasma moves it to the hidden icons), and it shows a muted
-microphone while the headset's own mute button is engaged.
+**The tray integration has only been tested on KDE Plasma 6 (Wayland).** It is not tied to KDE:
+the icon is a StatusNotifierItem, the protocol most desktop trays speak (GNOME needs the
+AppIndicator extension for it), so it should work elsewhere too — but nobody has tried, and
+raising the window on click relies on an activation token that only Plasma is known to pass.
+
+Closing the window keeps the app running in the tray; use **Quit** in the icon's right-click
+menu to stop it. While the headset is off or unplugged the icon goes passive (Plasma moves it to
+the hidden icons), and it shows a muted microphone while the headset's own mute button is
+engaged.
 
 Without a tray the app behaves like a plain window again: closing it quits, and a
 `--background` start gives up after 30 seconds.
